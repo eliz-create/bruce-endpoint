@@ -1,0 +1,62 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Bruce Astro Action",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://YOUR-PROJECT.vercel.app"
+    }
+  ],
+  "paths": {
+    "/api/bruce": {
+      "post": {
+        "operationId": "bruce_reading",
+        "description": "Réécrit le thème au style Bruce à partir d'un JSON déjà calculé.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "data"
+                ],
+                "properties": {
+                  "data": {
+                    "type": "object",
+                    "description": "BruceAstroDataV1"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Texte généré",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
