@@ -1,265 +1,173 @@
-// api/index.js — Vercel Serverless Function (Node.js / ESM)
+// api/index.js
+export const config = { runtime: 'edge' };
 
-export default async function handler(req, res) {
-  // 1) Méthode : POST uniquement
-  if (req.method !== 'POST') {
-    res.statusCode = 405;
-    res.setHeader('Allow', 'POST');
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ ok: false, error: 'POST only' }));
-    return;
-  }
-
-  // 2) Lire le corps JSON
-  let raw = '';
-  for await (const chunk of req) raw += chunk;
-  let body = {};
-  try {
-    body = raw ? JSON.parse(raw) : {};
-  } catch {
-    res.statusCode = 400;
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ ok: false, error: 'Invalid JSON' }));
-    return;
-  }
-
-  const data = body.data || {};
-  const meta = body.meta || {};
-  const response = { ok: true, received: data };
-
-  // 3) Mini numérologie (Chemin de vie) si date fournie
-  const b = data.birth || {};
-  if (b.year && b.month && b.day) {
-    response.numerology = {
-      life_path: computeLifePath(b.year, b.month, b.day),
-    };
-  } else {
-    response.numerology = null;
-  }
-
-  // 4) Auth Prokerala si variables présentes
-  let accessToken = null;
-  const hasCreds =
-    !!process.env.PROKERALA_CLIENT_ID && !!process.env.PROKERALA_CLIENT_SECRET;
-
-  if (hasCreds) {
-    try {
-      const tk = await getProkeralaToken(
-        process.env.PROKERALA_CLIENT_ID,
-        process.env.PROKERALA_CLIENT_SECRET
-      );
-      accessToken = tk.access_token || null;
-      response.prokerala = {
-        auth_ok: !!accessToken,
-        token_type: tk.token_type,
-        expires_in: tk.expires_in,
-      };
-    } catch (e) {
-      response.prokerala = {
-        auth_ok: false,
-        error: 'auth_failed',
-        detail: String(e?.message || e),
-      };
-    }
-  } else {
-    response.prokerala = { auth_ok: false, error: 'missing_credentials' };
-  }
-
-  // 5) Produit : Horoscope du jour
-  //    Requiert: meta.product === 'horoscope_daily' ET data.sign (FR ou EN)
-  if (
-    (meta.product === 'horoscope_daily' || meta.product === 'horoscope') &&
-    data.sign
-  ) {
-    if (!accessToken) {
-      response.horoscope = {
-        ok: false,
-        error: 'no_token',
-        note: 'Prokerala token missing',
-      };
-    } else {
-      try {
-        const signEn = normalizeSignToEnglish(String(data.sign));
-        if (!signEn) {
-          response.horoscope = {
-            ok: false,
-            error: 'invalid_sign',
-            note:
-              'Provide sign in FR ou EN. Exemple FR: "balance", EN: "libra".',
-          };
-        } else {
-          // Appel API Prokerala — daily horoscope
-          const api = await fetchDailyHoroscope(accessToken, signEn);
-          response.horoscope = api;
-        }
-      } catch (e) {
-        response.horoscope = {
-          ok: false,
-          error: 'fetch_failed',
-          detail: String(e?.message || e),
-        };
-      }
-    }
-  }
-
-  // 6) Réponse
-  res.statusCode = 200;
-  res.setHeader('Content-Type', 'application/json');
-  res.end(JSON.stringify(response));
+function json(res, status=200) {
+  return new Response(JSON.stringify(res, null, 2), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  });
 }
 
-/* --------------------- Utils: Prokerala --------------------- */
+// --- Utils ----------------------------------------------------
+function parseBody(req) {
+  return req.json().catch(() => ({}));
+}
 
-async function getProkeralaToken(clientId, clientSecret) {
-  // OAuth2 client_credentials
-  const form = new URLSearchParams();
-  form.set('grant_type', 'client_credentials');
-  form.set('client_id', clientId);
-  form.set('client_secret', clientSecret);
+function toInt(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
 
+// Pythagorean Life Path (very common rule)
+function lifePathFromYMD({year, month, day}) {
+  const sumDigits = (n) => (''+n).split('').reduce((a,b)=>a+Number(b||0),0);
+  const reduce = (n) => {
+    while (n > 9 && ![11,22,33].includes(n)) n = sumDigits(n);
+    return n;
+  };
+  if (![year,month,day].every(Boolean)) return null;
+  return reduce(reduce(year)+reduce(month)+reduce(day));
+}
+
+// Build clean “product blocks” Bruce can use
+function buildStubs({meta={}, people={}, locale='fr'}) {
+  const name = people?.a?.name || 'Client';
+  return {
+    natal: {
+      meta: { product: 'natal', tier: meta.tier || 'classic', locale },
+      people, placements: null,
+      insights: { strengths: [], challenges: [], timing: [] },
+      note: 'stub_natal: fournissez placements/aspects côté serveur pour la fiabilité.'
+    },
+    synastry: {
+      meta: { product: 'synastry', tier: meta.tier || 'classic', locale },
+      people, synastry: { cross_aspects: [] },
+      insights: { strengths: [], challenges: [], timing: [] },
+      note: 'stub_synastry: fournissez cross_aspects côté serveur pour la fiabilité.'
+    },
+    transits: {
+      meta: { product: 'transits', tier: meta.tier || 'classic', locale },
+      people, transits: { period: null, items: [] },
+      insights: { strengths: [], challenges: [] },
+      note: 'stub_transits: fournissez une liste datée d’aspects/notes.'
+    },
+    solar: {
+      meta: { product: 'solar', tier: meta.tier || 'classic', locale },
+      people, solar: { year: null, sun_house: null, asc_sign: null },
+      insights: { strengths: [], challenges: [] },
+      note: 'stub_solar: fournissez révolution solaire (maison du Soleil, Asc RS…).'
+    },
+    chinese: {
+      meta: { product: 'chinese', tier: meta.tier || 'classic', locale },
+      people, chinese: { system: 'zodiac', animal: null, element: null, yin_yang: null },
+      insights: { strengths: [], challenges: [] },
+      note: 'stub_chinese: fournissez BaZi complet ou au moins animal+élément.'
+    },
+    numerology: {
+      meta: { product: 'numerology', tier: meta.tier || 'classic', locale },
+      people, numerology: {},
+      insights: { strengths: [], challenges: [] },
+      note: 'numerology: calculs locaux OK (Life Path).'
+    },
+    all: { note: 'utilisez une combinaison des blocs ci-dessus' }
+  };
+}
+
+// --- Prokerala OAuth (token uniquement pour l’instant) --------
+async function prokeralaAuth() {
+  const cid = process.env.PROKERALA_CLIENT_ID;
+  const secret = process.env.PROKERALA_CLIENT_SECRET;
+  if (!cid || !secret) return { ok:false, error:'Missing Prokerala credentials' };
+
+  const body = new URLSearchParams();
+  body.set('grant_type', 'client_credentials');
   const r = await fetch('https://api.prokerala.com/token', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: form.toString(),
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+    // basic auth in body (per Prokerala docs via Postman)
+    // if needed, also include Authorization header "Basic ..." (not required in most setups)
   });
 
   if (!r.ok) {
-    const txt = await safeText(r);
-    throw new Error(`token_http_${r.status}: ${txt}`);
+    return { ok:false, status:r.status, error:'token_failed', api_raw: await r.text().catch(()=>null) };
   }
-  return await r.json();
+  const tok = await r.json().catch(()=>null);
+  return { ok:true, token: tok?.access_token, token_type: tok?.token_type, expires_in: tok?.expires_in };
 }
 
-async function fetchDailyHoroscope(accessToken, signEn) {
-  // Endpoint Prokerala — daily horoscope
-  // NOTE: on envoie seulement 'sign' pour rester tolérant (locale/params peuvent varier)
-  const url = new URL(
-    'https://api.prokerala.com/v2/astrology/horoscope/daily'
-  );
-  url.searchParams.set('sign', signEn);
-  // Optionnel : timezone ou date si besoin
-  // url.searchParams.set('timezone', 'UTC');
+// --- Main handler ---------------------------------------------
+export default async function handler(req) {
+  if (req.method !== 'POST') {
+    return json({ ok:false, error:'POST only' }, 405);
+  }
 
-  const r = await fetch(url.toString(), {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/json',
-    },
-  });
+  const body = await parseBody(req);
+  const data = body?.data || {};
+  const meta = data?.meta || {};
+  const locale = (meta.locale === 'en' ? 'en' : 'fr');
 
-  const raw = await safeJson(r);
+  // Prepare response skeleton
+  const out = {
+    ok: true,
+    received: data,
+    numerology: null,
+    horoscope: null,
+    products: {},
+    prokerala: null,
+  };
 
-  if (!r.ok) {
-    return {
+  // 1) Try Prokerala auth (so tu sais si les clés sont OK)
+  try {
+    out.prokerala = await prokeralaAuth();
+  } catch(e) {
+    out.prokerala = { ok:false, error:'auth_exception', detail: String(e?.message||e) };
+  }
+
+  // 2) Numerology (Life Path) — calcul local si date fournie
+  const y = toInt(data?.people?.a?.birth?.year);
+  const m = toInt(data?.people?.a?.birth?.month);
+  const d = toInt(data?.people?.a?.birth?.day);
+  const lp = lifePathFromYMD({year:y, month:m, day:d});
+  if (lp) {
+    out.numerology = { life_path: lp };
+  }
+
+  // 3) Horoscope (désactivé proprement tant que l’URL exacte n’est pas réglée)
+  if (data?.horoscope?.sign) {
+    out.horoscope = {
       ok: false,
-      status: r.status,
-      api_raw: raw,
+      reason: 'route_non_connectee',
+      hint: 'Importe https://api.prokerala.com/spec/astrology.v2.yaml dans Postman et copie l’URL exacte de “Daily Horoscope”. Remplace ensuite HORO_PATH et les noms des paramètres.'
     };
   }
 
-  // On tente d'extraire un texte lisible si dispo
-  const text =
-    raw?.data?.horoscope ||
-    raw?.data?.prediction ||
-    raw?.result?.horoscope ||
-    raw?.horoscope ||
-    null;
+  // 4) “Produits” : renvoyer des blocs stubs propres que Bruce sait développer
+  const stubs = buildStubs({ meta, people: data?.people || {}, locale });
 
-  return {
-    ok: true,
-    sign: signEn,
-    text,
-    api_raw: raw, // on renvoie brut aussi pour debug/validation
-  };
-}
+  // Choix de produit(s)
+  const wanted = (meta.product || 'all');
+  const push = (k, v) => (out.products[k] = v);
 
-/* --------------------- Utils: Numérologie --------------------- */
-
-function computeLifePath(year, month, day) {
-  const n = `${year}${pad2(month)}${pad2(day)}`;
-  return reduceKeepMaster(sumDigits(n));
-}
-
-function sumDigits(strDigits) {
-  return String(strDigits)
-    .split('')
-    .reduce((a, b) => a + Number(b), 0);
-}
-
-function reduceKeepMaster(n) {
-  const keep = new Set([11, 22, 33]);
-  while (n > 9 && !keep.has(n)) {
-    n = sumDigits(String(n));
-  }
-  return n;
-}
-
-function pad2(n) {
-  n = Number(n);
-  return n < 10 ? `0${n}` : String(n);
-}
-
-/* --------------------- Utils: Signes FR -> EN --------------------- */
-
-function normalizeSignToEnglish(input) {
-  const val = String(input || '')
-    .trim()
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, ''); // enlève les accents
-
-  const map = {
-    // FR (accent/variantes) -> EN
-    belier: 'aries',
-    taureau: 'taurus',
-    gemeaux: 'gemini',
-    cancer: 'cancer',
-    lion: 'leo',
-    vierge: 'virgo',
-    balance: 'libra',
-    scorpion: 'scorpio',
-    sagittaire: 'sagittarius',
-    capricorne: 'capricorn',
-    verseau: 'aquarius',
-    poissons: 'pisces',
-
-    // EN (acceptés tels quels)
-    aries: 'aries',
-    taurus: 'taurus',
-    gemini: 'gemini',
-    leo: 'leo',
-    virgo: 'virgo',
-    libra: 'libra',
-    scorpio: 'scorpio',
-    sagittarius: 'sagittarius',
-    capricorn: 'capricorn',
-    aquarius: 'aquarius',
-    pisces: 'pisces',
-  };
-
-  return map[val] || null;
-}
-
-/* --------------------- Utils: Safe JSON/TEXT --------------------- */
-
-async function safeJson(r) {
-  try {
-    return await r.json();
-  } catch {
-    try {
-      const t = await r.text();
-      return { text: t };
-    } catch {
-      return null;
+  if (wanted === 'all') {
+    push('natal', stubs.natal);
+    push('synastry', stubs.synastry);
+    push('transits', stubs.transits);
+    push('solar', stubs.solar);
+    push('chinese', stubs.chinese);
+    push('numerology', { ...stubs.numerology, numerology: out.numerology ?? {} });
+  } else {
+    const allowed = ['natal','synastry','transits','solar','chinese','numerology'];
+    if (allowed.includes(wanted)) {
+      if (wanted === 'numerology') {
+        push('numerology', { ...stubs.numerology, numerology: out.numerology ?? {} });
+      } else {
+        push(wanted, stubs[wanted]);
+      }
+    } else {
+      push('info', { note: 'meta.product inconnu, utilisez all/natal/synastry/transits/solar/chinese/numerology' });
     }
   }
-}
 
-async function safeText(r) {
-  try {
-    return await r.text();
-  } catch {
-    return '';
-  }
+  return json(out);
 }
